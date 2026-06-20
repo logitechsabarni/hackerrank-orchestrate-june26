@@ -1,0 +1,23 @@
+{
+  "_note": "Placeholder. Run `python -m evaluation.evaluate` with a real GEMINI_API_KEY to populate this file with real numbers.",
+  "accuracy": {
+    "claim_status_accuracy": null,
+    "issue_type_accuracy": null,
+    "object_part_accuracy": null,
+    "overall_accuracy": null,
+    "n_samples": 0
+  },
+  "usage": {
+    "text_calls": 0,
+    "vision_calls": 0,
+    "total_calls": 0,
+    "cache_hits": 0,
+    "failed_calls": 0,
+    "retried_calls": 0,
+    "estimated_input_tokens": 0,
+    "estimated_output_tokens": 0
+  },
+  "image_count": 0,
+  "n_claims": 0,
+  "runtime_seconds": 0
+}
