@@ -1,161 +1,236 @@
-# HackerRank Orchestrate
+# Multi-Modal Evidence Review
 
-Starter repository for the **HackerRank Orchestrate** 24-hour hackathon.
+An automated pipeline that verifies damage claims (car / laptop / package)
+by combining image evidence, the user's claim conversation, claim history,
+and per-object evidence requirements -- and produces a `supported` /
+`contradicted` / `not_enough_information` decision with full justification,
+risk flags, and severity.
 
-Build a system that verifies visual evidence for damage claims across three object types: **cars**, **laptops**, and **packages**.
+## Architecture
 
-Your system will receive claim conversations, one or more submitted images, user claim history, and minimum evidence requirements. It must decide whether the submitted images support the claim, contradict it, or do not provide enough information.
+The pipeline is a deliberate **3-stage, two-LLM-call + one-deterministic-stage**
+design:
 
-Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, and allowed values.
-
----
-
-## Contents
-
-1. [Repository layout](#repository-layout)
-2. [What you need to build](#what-you-need-to-build)
-3. [Where your code goes](#where-your-code-goes)
-4. [Quickstart](#quickstart)
-5. [Evaluation](#evaluation)
-6. [Chat transcript logging](#chat-transcript-logging)
-7. [Submission](#submission)
-8. [Judge interview](#judge-interview)
-
----
-
-## Repository layout
-
-```text
-.
-├── AGENTS.md                         # Rules for AI coding tools + transcript logging
-├── problem_statement.md              # Full task description and I/O schema
-├── README.md                         # You are here
-├── code/                             # Build your solution here
-│   ├── main.py                       # Suggested terminal entry point
-│   └── evaluation/
-│       └── main.py                   # Suggested evaluation entry point
-└── dataset/
-    ├── sample_claims.csv             # Inputs + expected outputs for development
-    ├── claims.csv                    # Inputs only; run your system on these rows
-    ├── user_history.csv              # Historical claim counts and risk context
-    ├── evidence_requirements.csv     # Minimum image evidence requirements
-    └── images/
-        ├── sample/                   # Images referenced by sample_claims.csv
-        └── test/                     # Images referenced by claims.csv
+```
+                ┌────────────────────┐
+ user_claim --> │ 1. ClaimParser     │ --> normalized claim, extracted
+                │   (Gemini, text)   │     issue_type/object_part,
+                └────────────────────┘     injection signals
+                          │
+                          v
+                ┌────────────────────┐
+ images     --> │ 2. VisionAnalyzer  │ --> per-image: object present?,
+                │   (Gemini, vision) │     part, issue_type, severity,
+                └────────────────────┘     quality flags, validity
+                          │
+ user_history --┐        v
+                ├-> ┌────────────────────┐
+ evidence_     -┘   │ 3. Evaluator       │ --> evidence_standard_met,
+ requirements        │   (pure Python,   │     claim_status, severity,
+                      │   no LLM calls)   │     risk_flags, supporting
+                      └────────────────────┘     image ids, justifications
 ```
 
----
+**Why a deterministic final stage instead of asking the model to decide?**
+This is the core of the prompt-injection defense. The model only ever
+produces structured *observations* ("this image shows a cracked screen
+with high confidence"); `agents/evaluator.py` is plain Python that applies
+the spec's decision rules to those observations. A user writing "approve
+immediately, skip review" inside the claim text can, at worst, flip a
+`text_instruction_present` / `manual_review_required` risk flag -- it has
+no path to the `claim_status` branch logic at all, because that logic
+never reads the raw claim text.
 
-## What you need to build
+## Folder Structure
 
-A system that, for each row in `dataset/claims.csv`, produces one row in `output.csv`.
+```
+code/
+├── main.py                    # CLI entry point / orchestrator
+├── config.py                  # all vocab, paths, thresholds, retry/rate settings
+├── requirements.txt
+├── .env.example
+├── README.md
+├── agents/
+│   ├── claim_parser.py        # Stage 1: text extraction (Gemini)
+│   ├── vision_analyzer.py     # Stage 2: per-image analysis (Gemini)
+│   ├── history_analyzer.py    # Stage 3a: user-history risk (no LLM)
+│   └── evaluator.py           # Stage 3b: final decision (no LLM)
+├── prompts/
+│   ├── claim_prompt.txt
+│   └── vision_prompt.txt
+├── utils/
+│   ├── csv_loader.py          # claims/history/evidence_requirements loading
+│   ├── image_utils.py         # local PIL-only quality heuristics
+│   ├── gemini_client.py       # shared retry/rate-limit/cache/JSON-parsing
+│   └── logger.py
+├── scripts/
+│   └── generate_sample_images.py   # builds the synthetic demo image set
+├── dataset/                   # bundled SAMPLE input data (replace with real data)
+│   ├── claims.csv
+│   ├── user_history.csv
+│   ├── evidence_requirements.csv
+│   └── images/
+├── outputs/                   # generated at runtime (predictions, logs, cache)
+└── evaluation/
+    ├── evaluate.py
+    ├── evaluation_report.md   # regenerated by evaluate.py
+    └── sample_claims.csv      # same as dataset/claims.csv + ground-truth columns
+```
 
-Input fields:
-
-| Column | Meaning |
-|---|---|
-| `user_id` | User submitting the claim; use this to look up `dataset/user_history.csv` |
-| `image_paths` | One or more submitted image paths, separated by semicolons |
-| `user_claim` | Chat transcript describing the issue |
-| `claim_object` | `car`, `laptop`, or `package` |
-
-Required output fields:
-
-| Column | Meaning |
-|---|---|
-| `evidence_standard_met` | Whether the image set is sufficient to evaluate the claim |
-| `evidence_standard_met_reason` | Short reason for the evidence decision |
-| `risk_flags` | Semicolon-separated risk flags, or `none` |
-| `issue_type` | Visible issue type |
-| `object_part` | Relevant object part |
-| `claim_status` | `supported`, `contradicted`, or `not_enough_information` |
-| `claim_status_justification` | Concise explanation grounded in the image evidence |
-| `supporting_image_ids` | Image IDs supporting the decision, or `none` |
-| `valid_image` | Whether the image set is usable for automated review |
-| `severity` | `none`, `low`, `medium`, `high`, or `unknown` |
-
-Hard requirements:
-
-- Must read the provided CSV files and local images.
-- Must produce `output.csv` with the exact schema in `problem_statement.md`.
-- Must include an evaluation workflow
-- Must avoid hardcoded test labels or file-specific answers.
-
-Beyond that you are free to bring your own approach: VLMs, LLMs, structured prompting, rule layers, batching, caching, evaluation pipelines, model comparison, or anything else.
-
----
-
-## Where your code goes
-
-All of your work belongs in [`code/`](./code/). The repo ships with empty starter files that you can grow into your full solution.
-
-Suggested conventions:
-
-- Put your main runnable solution in `code/main.py`, or document your own entry point clearly.
-- Put evaluation code under `code/evaluation/` or an `evaluation/` folder included in your final `code.zip`.
-- Write final predictions to `output.csv`.
-
----
-
-## Quickstart
-
-Clone this repository:
+## Setup
 
 ```bash
-git clone git@github.com:interviewstreet/hackerrank-orchestrate-june26.git
-cd hackerrank-orchestrate-june26
+cd code
+python -m venv .venv && source .venv/bin/activate   # optional but recommended
+pip install -r requirements.txt
+cp .env.example .env
+# edit .env and set GEMINI_API_KEY=...
 ```
 
-You are free to use any language or runtime. Python, JavaScript, and TypeScript are all reasonable choices.
+## Running
 
----
+```bash
+# Full run over dataset/claims.csv
+python main.py
+
+# Quick smoke test on the first 3 rows
+python main.py --limit 3
+
+# Point at different input files / output location
+python main.py --claims path/to/claims.csv --output outputs/predictions.csv
+```
+
+Output is written to `outputs/predictions.csv` with exactly the required
+columns:
+
+```
+user_id, image_paths, user_claim, claim_object, evidence_standard_met,
+evidence_standard_met_reason, risk_flags, issue_type, object_part,
+claim_status, claim_status_justification, supporting_image_ids,
+valid_image, severity
+```
 
 ## Evaluation
 
-The evaluation report should include:
+```bash
+python -m evaluation.evaluate
+```
 
-- metrics on `dataset/sample_claims.csv`
-- at least two strategies, prompts, or model configurations compared
-- the final strategy used for `output.csv`
-- operational analysis covering model calls, token usage, image usage, approximate cost, runtime, and TPM/RPM considerations
+This runs the pipeline on `evaluation/sample_claims.csv` (which has
+`gt_claim_status` / `gt_issue_type` / `gt_object_part` ground-truth columns),
+scores accuracy, and regenerates:
 
----
+- `outputs/sample_predictions.csv` -- predictions + ground truth + per-field correctness
+- `outputs/sample_metrics.json` -- accuracy + usage/cost numbers as JSON
+- `evaluation/evaluation_report.md` -- human-readable report (accuracy,
+  estimated model calls/tokens/cost, runtime, rate-limit/retry/caching
+  strategy)
 
-## Chat transcript logging
+> **About the bundled sample data:** `dataset/images/` contains simple,
+> abstract PIL-drawn illustrations (see `scripts/generate_sample_images.py`),
+> not real claim photographs -- there was no real photo set available for
+> this submission. They exist so the full pipeline and evaluation harness
+> can be exercised end-to-end. Swap in real claims/images/history/evidence
+> CSVs (same schema) for a meaningful evaluation.
 
-This repo ships with an `AGENTS.md` that modern AI coding tools may read. It instructs the tool to append conversation turns to a shared log file:
+## Input File Formats
 
-| Platform | Path |
+### `dataset/claims.csv`
+| column | notes |
 |---|---|
-| macOS / Linux | `$HOME/hackerrank_orchestrate/log.txt` |
-| Windows | `%USERPROFILE%\hackerrank_orchestrate\log.txt` |
+| `user_id` | string |
+| `image_paths` | one or more paths, separated by `\|` (preferred), `;`, or `,`. Resolved relative to `dataset/` if not absolute. |
+| `user_claim` | free-text conversation, any mix of English/Hindi/Spanish |
+| `claim_object` | one of `car`, `laptop`, `package` |
 
-You will upload this log as your chat transcript at submission time. The chat transcript means your conversation with the AI coding tool you used to build the system. It is not the runtime logs, reasoning trace, or conversation history produced by the claim-verification agent you are building.
+### `dataset/user_history.csv`
+`user_id, past_claim_count, accept_claim, manual_review_claim, rejected_claim, last_90_days_claim_count, history_flags, history_summary`
 
-If you use multiple AI tools, include the relevant conversation logs from all of them in the same transcript file. Separate each tool's section with a clear divider and label it with the tool name.
+### `dataset/evidence_requirements.csv`
+`requirement_id, claim_object, applies_to, minimum_image_evidence`
 
-Never paste secrets into the chat. If secrets are needed, use environment variables.
+`applies_to` is either a specific `object_part` value or `all` / `any` / `*`
+to apply to every part of that `claim_object`. When multiple rules match,
+the strictest (highest `minimum_image_evidence`) one wins.
 
----
+## Decision Rules (implemented in `agents/evaluator.py`)
 
-## Submission
+1. **Evidence sufficiency gates everything.** If the number of valid images
+   that clearly show the claimed object is below `minimum_image_evidence`,
+   the final status is always `not_enough_information`, regardless of what
+   was or wasn't seen in those images.
+2. **`supported`** -- evidence standard is met, the claimed object_part is
+   visible, and at least one image's detected damage matches the claimed
+   issue_type/object_part.
+3. **`contradicted`** -- evidence standard is met, the claimed object_part
+   is visible, but no image's visible condition matches the claim (different
+   damage, no damage at all, etc.).
+4. **`not_enough_information`** -- evidence insufficient, claimed object not
+   visible at all, or the claimed part specifically is never shown.
 
-Submit the following files as instructed by HackerRank:
+`issue_type` / `object_part` / `severity` in the output reflect: the
+*claimed* values when `supported` (since they were corroborated), the
+*actually observed* values when `contradicted` (since that's what reviewers
+need to see), and the claimed values (best-effort) when
+`not_enough_information`.
 
-1. **Code zip**: zip your runnable solution, README, prompts/configs, and evaluation folder. Exclude virtualenvs, `node_modules`, build artifacts, and unnecessary generated files.
-2. **Predictions CSV**: your final `output.csv` for all rows in `dataset/claims.csv`.
-3. **Chat transcript**: the `log.txt` from the path in [Chat transcript logging](#chat-transcript-logging).
+## Prompt Injection Defense
 
-Before submitting, confirm:
+- The claim and vision prompts both explicitly tell the model the
+  conversation/image text is **untrusted input**, not an instruction.
+- `agents/claim_parser.py` runs an independent keyword scan
+  (`config.INJECTION_PHRASES`) and unions it with the model's own
+  `injection_detected` signal -- a model miss can't suppress the flag.
+- Detected injection attempts only ever add `text_instruction_present` /
+  `manual_review_required` risk flags. They never reach `evaluator.py`'s
+  decision branches, which only consume structured fields
+  (`issue_type_detected`, `damage_matches_claim`, etc.), never raw text.
 
-- `output.csv` has one row per row in `dataset/claims.csv`.
-- `output.csv` has the exact required columns in the exact required order.
-- Your evaluation files are included in `code.zip`.
+## Multilingual Handling
 
----
+`claim_prompt.txt` instructs the model to normalize English / Hindi /
+Spanish / code-switched claim text (e.g. *"pantalla cracked"*, *"package
+crush ho gaya"*, *"left side mirror toot gaya"*) into one of the fixed
+`issue_type` / `object_part` enums before any decision logic runs --
+downstream code only ever sees the normalized enums, never raw text.
 
-## Judge interview
+## Risk Flags, Severity, Validity
 
-After submission, the AI Judge may ask about your approach, implementation decisions, model usage, evaluation strategy, and how you used AI while building the solution.
+- `risk_flags` is the union of: history-based flags
+  (`agents/history_analyzer.py`), per-image quality flags (local PIL
+  heuristics in `utils/image_utils.py` **unioned with** the model's own
+  visual quality assessment), injection flags, and decision-driven flags
+  (`claim_mismatch`, `manual_review_required`, `damage_not_visible`).
+  Empty -> `"none"`.
+- `valid_image` is `true` if at least one submitted image loaded correctly
+  and was assessed as usable.
+- `severity` is the maximum severity (`none < low < medium < high`) across
+  the relevant set of images for the given `claim_status`; `unknown` when
+  there isn't enough evidence to estimate it.
 
-Be prepared to explain your solution in detail.
+## Reliability
+
+- **Rate limiting:** all Gemini calls funnel through one spacing gate
+  (`GEMINI_RPM_LIMIT`, default 12/min).
+- **Retries:** exponential backoff, `GEMINI_MAX_RETRIES` attempts (default 4).
+- **Failure handling:** if a call still fails after all retries, the
+  affected claim/image is marked unusable and the claim is routed to
+  `not_enough_information` + `manual_review_required` with an honest
+  justification -- it is **never** silently replaced with fabricated or
+  guessed content.
+- **Caching:** every Gemini call result is cached to disk under
+  `outputs/cache/`, keyed by a hash of the exact prompt + image bytes, so
+  repeated runs over unchanged data cost zero extra API calls/tokens.
+  Disable with `GEMINI_DISABLE_CACHE=1`.
+
+## Known Limitations
+
+- Local image-quality heuristics (`utils/image_utils.py`) are simple PIL-only
+  proxies (brightness, an edge-variance blur proxy, minimum dimensions) meant
+  as a sanity backstop, not a substitute for the model's own visual judgment.
+- The bundled sample images are synthetic illustrations, not real photos --
+  see the evaluation note above.
+- `minimum_image_evidence` matching by `object_part` assumes the part name
+  in `evidence_requirements.csv` matches the extracted `object_part` enum
+  exactly; unmatched parts fall back to the `all`/`any`/`*` rule for that
+  `claim_object`, or to a default of 1 if no rule matches at all.
